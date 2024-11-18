@@ -110,7 +110,7 @@ class RankListwiseOSLLM(ListwiseRankLLM):
                 download_dir=os.getenv("HF_HOME"),
                 enforce_eager=False,
                 max_logprobs=30,
-                tensor_parallel_size=num_gpus
+                tensor_parallel_size=num_gpus,
                 max_model_len=4096
             )
             self._tokenizer = self._llm.get_tokenizer()
