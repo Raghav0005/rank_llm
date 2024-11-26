@@ -101,6 +101,7 @@ class Reranker:
         ranking_execution_summary_dirname: str = "ranking_execution_summary",
         vllm_batched: bool = False,
         sglang_batched: bool = False,
+        mlc_batched: bool = False,
         **kwargs,
     ) -> str:
         """
@@ -144,6 +145,8 @@ class Reranker:
             name += "_vllm"
         if sglang_batched:
             name += "_sglang"
+        if mlc_batched:
+            name += "_mlc"
 
         # write rerank results
         writer = DataWriter(results)
@@ -236,6 +239,7 @@ class Reranker:
                 ("system_message", None),
                 ("vllm_batched", False),
                 ("sglang_batched", False),
+                ("mlc_batched", False),
             ]
             [
                 context_size,
@@ -248,6 +252,7 @@ class Reranker:
                 system_message,
                 vllm_batched,
                 sglang_batched,
+                mlc_batched,
             ] = extract_kwargs(keys_and_defaults, **kwargs)
 
             agent = RankListwiseOSLLM(
@@ -267,6 +272,7 @@ class Reranker:
                 system_message=system_message,
                 vllm_batched=vllm_batched,
                 sglang_batched=sglang_batched,
+                mlc_batched=mlc_batched,
             )
 
             print(f"Completed loading {model_path}")
