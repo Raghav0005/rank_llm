@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
+import re
 from functools import cmp_to_key
 from importlib.resources import files
 from typing import Any
@@ -75,6 +77,9 @@ class PointwiseVLLM(PointwiseRankLLM):
         batch_size: int = 32,
         max_concurrent_llm_calls: int | None = None,
         disable_thinking_extra_body: bool = True,
+        scoring_mode: str = "binary_yes_no",
+        max_generation_tokens: int = 512,
+        template_values: dict[str, str] | None = None,
     ) -> None:
         super().__init__(
             model=model,
@@ -90,6 +95,9 @@ class PointwiseVLLM(PointwiseRankLLM):
         self._tokenizer = self._vllm.get_tokenizer()
         self._llm_concurrency_sem: asyncio.Semaphore | None = None
         self._max_concurrent = max_concurrent_llm_calls or max(batch_size, 1)
+        self._template_values = template_values or {}
+        self._scoring_mode = scoring_mode
+        self._max_generation_tokens = max_generation_tokens
 
         yes_ids = _single_token_ids_from_strings(
             self._tokenizer, POINTWISE_YES_ALLOWED_TOKEN_SPELLINGS
@@ -105,11 +113,21 @@ class PointwiseVLLM(PointwiseRankLLM):
                 "maps at least one yes/no spelling to one token."
             )
 
-        self._score_extra_body: dict[str, Any] = {
-            "allowed_token_ids": self._allowed_token_ids,
-        }
+        self._score_extra_body: dict[str, Any] = {}
+        if self._scoring_mode == "binary_yes_no":
+            self._score_extra_body["allowed_token_ids"] = self._allowed_token_ids
         if disable_thinking_extra_body:
             self._score_extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+
+        if self._scoring_mode not in {
+            "binary_yes_no",
+            "tagged_score_0_100",
+            "json_doc_score_0_10",
+        }:
+            raise ValueError(
+                "PointwiseVLLM scoring_mode must be one of: "
+                "'binary_yes_no', 'tagged_score_0_100', 'json_doc_score_0_10'."
+            )
 
     def _get_llm_concurrency_sem(self) -> asyncio.Semaphore:
         if self._llm_concurrency_sem is None:
@@ -140,7 +158,7 @@ class PointwiseVLLM(PointwiseRankLLM):
 
         body_empty = self._inference_handler._format_template(
             "body",
-            {"query": query, "doc_content": ""},
+            {"query": query, "doc_content": "", **self._template_values},
         )
         user_content = body_empty.replace("<unk>", "")
         messages: list[dict[str, str]] = []
@@ -153,7 +171,8 @@ class PointwiseVLLM(PointwiseRankLLM):
     def create_prompt(
         self, result: Result, index: int
     ) -> tuple[list[dict[str, str]], int]:
-        reserved_for_output = 8
+        # Reserve space for generated output so prompt + completion fit context
+        reserved_for_output = max(8, self.num_output_tokens())
         overhead = self._input_token_count(self._probe_messages(result))
         max_doc_tokens = max(
             16,
@@ -167,6 +186,7 @@ class PointwiseVLLM(PointwiseRankLLM):
             tokenizer=self._tokenizer,
             num_few_shot_examples=0,
             fewshot_examples=[],
+            template_values=self._template_values,
         )
         n_tok = self._input_token_count(messages)
         if n_tok > self._context_size - reserved_for_output:
@@ -183,6 +203,8 @@ class PointwiseVLLM(PointwiseRankLLM):
         return len(self._tokenizer.encode(prompt))
 
     def num_output_tokens(self) -> int:
+        if self._scoring_mode in {"tagged_score_0_100", "json_doc_score_0_10"}:
+            return self._max_generation_tokens
         return 1
 
     def cost_per_1k_token(self, input_token: bool) -> float:
@@ -191,16 +213,65 @@ class PointwiseVLLM(PointwiseRankLLM):
     async def _score_one_async(
         self, messages: list[dict[str, str]], *, use_sem: bool
     ) -> tuple[str, int, float, dict[str, Any]]:
-        if use_sem:
-            async with self._get_llm_concurrency_sem():
+        async def _score_request() -> tuple[str, int, float, dict[str, Any]]:
+            if self._scoring_mode == "binary_yes_no":
                 return await self._vllm.chat_completion_score_async(
                     messages,
                     extra_body=self._score_extra_body,
                 )
-        return await self._vllm.chat_completion_score_async(
-            messages,
-            extra_body=self._score_extra_body,
-        )
+
+            text, reasoning, usage = await self._vllm.chat_completion_async(
+                messages,
+                max_tokens=self._max_generation_tokens,
+                temperature=0.0,
+                extra_body=self._score_extra_body,
+            )
+            full_text = text or ""
+            if reasoning:
+                full_text = f"{full_text}\n\n<reasoning>\n{reasoning}\n</reasoning>"
+            if self._scoring_mode == "tagged_score_0_100":
+                score = self._extract_tagged_score(full_text)
+            else:
+                score = self._extract_json_doc_score(full_text)
+            out_tok = int(
+                usage.get("completion_tokens") or usage.get("output_tokens") or 0
+            )
+            return full_text, out_tok, score, usage
+
+        if use_sem:
+            async with self._get_llm_concurrency_sem():
+                return await _score_request()
+        return await _score_request()
+
+    @staticmethod
+    def _extract_tagged_score(text: str) -> float:
+        matches = re.findall(r"<score>\s*([+-]?\d+(?:\.\d+)?)\s*</score>", text)
+        if not matches:
+            return -1.0
+        try:
+            score = float(matches[-1])
+        except ValueError:
+            return -1.0
+        return max(0.0, min(100.0, score))
+
+    @staticmethod
+    def _extract_json_doc_score(text: str) -> float:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return -1.0
+        try:
+            payload = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return -1.0
+
+        for key in ("[1]", "1"):
+            if key in payload:
+                try:
+                    score = float(payload[key])
+                except (TypeError, ValueError):
+                    return -1.0
+                return max(0.0, min(10.0, score))
+        return -1.0
 
     def run_llm(
         self, prompt: str | list[dict[str, str]], **kwargs: Any
@@ -345,10 +416,7 @@ class PointwiseVLLM(PointwiseRankLLM):
                     out_tok,
                     score,
                     usage,
-                ) = await self._vllm.chat_completion_score_async(
-                    msgs,
-                    extra_body=self._score_extra_body,
-                )
+                ) = await self._score_one_async(msgs, use_sem=False)
             return qi, ci, msgs, n_tok, text, out_tok, score, usage
 
         rows = await asyncio.gather(
